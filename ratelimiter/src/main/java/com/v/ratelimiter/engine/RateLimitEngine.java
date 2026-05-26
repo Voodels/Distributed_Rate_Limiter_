@@ -12,6 +12,7 @@ import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.function.Supplier;
 
 @Slf4j
 @Service
@@ -55,16 +56,19 @@ public class RateLimitEngine {
         RateLimitRule rule   = ruleService.getRule(clientId);
         LocalBucket   bucket = bucketStore.getOrCreate(clientId, rule);
 
+        boolean allowed;
+
         if (bucket.acquireRefreshLock()) {
             try {
-                refreshFromRedis(clientId, bucket, rule);
+                allowed = refreshFromRedis(clientId, bucket, rule);
             } catch (Exception e) {
                 bucket.refreshFailed();
                 log.warn("Redis refresh failed for clientId={}, using stale cache", clientId);
+                allowed = bucket.tryConsume();
             }
+        } else {
+            allowed = bucket.tryConsume();
         }
-
-        boolean allowed = bucket.tryConsume();
 
         if (allowed) {
             meterRegistry.counter("rl.requests.allowed", "clientId", clientId).increment();
@@ -78,16 +82,19 @@ public class RateLimitEngine {
 
     /**
      * Refreshes local bucket from Redis — the authoritative source.
+     * Returns true if Redis allowed the request (token already consumed in Redis).
+     * When true, the caller must NOT call tryConsume() — the decision is already made.
+     * When false, Redis denied (or the key didn't exist yet).
      * Wrapped by circuit breaker: after repeated failures, falls through
      * to redisRefreshFallback (no-op) leaving local cache in degraded mode.
      */
     @CircuitBreaker(name = "redisRateLimiter", fallbackMethod = "redisRefreshFallback")
-    public void refreshFromRedis(String clientId, LocalBucket bucket, RateLimitRule rule) {
+    public boolean refreshFromRedis(String clientId, LocalBucket bucket, RateLimitRule rule) {
         Timer timer = meterRegistry.timer("rl.redis.latency", "clientId", clientId);
 
         double now = System.currentTimeMillis() / 1000.0;
 
-        List<?> res = timer.recordCallable(() ->
+        List<?> res = timer.record((Supplier<List<?>>) () ->
             redisTemplate.execute(
                 TOKEN_BUCKET,
                 List.of("rl:" + clientId),
@@ -98,8 +105,10 @@ public class RateLimitEngine {
             )
         );
 
+        boolean redisAllowed = ((Number) res.get(0)).intValue() == 1;
         double redisTokens = ((Number) res.get(1)).doubleValue();
         bucket.reconcile(redisTokens);
+        return redisAllowed;
     }
 
     /**
@@ -108,11 +117,12 @@ public class RateLimitEngine {
      * Next refresh attempt happens when CB allows it (5s).
      */
     @SuppressWarnings("unused")
-    public void redisRefreshFallback(String clientId, LocalBucket bucket, RateLimitRule rule, Throwable t) {
+    public boolean redisRefreshFallback(String clientId, LocalBucket bucket, RateLimitRule rule, Throwable t) {
         bucket.refreshFailed();
         bucket.postponeRefresh();
         meterRegistry.counter("rl.circuitbreaker.fallback", "clientId", clientId).increment();
         meterRegistry.counter("rl.redis.sync.failure").increment();
+        return bucket.tryConsume();
     }
 
     /**

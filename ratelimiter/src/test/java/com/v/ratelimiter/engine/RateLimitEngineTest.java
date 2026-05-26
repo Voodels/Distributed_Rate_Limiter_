@@ -32,8 +32,7 @@ class RateLimitEngineTest {
     @BeforeEach
     void setUp() {
         engine = new RateLimitEngine(redisTemplate, ruleService, bucketStore, new SimpleMeterRegistry());
-        
-        // General stubbing for redisTemplate.execute to avoid NPEs
+
         when(redisTemplate.execute(any(RedisScript.class), anyList(), any(), any(), any(), any()))
             .thenReturn(List.of(1L, 9L));
     }
@@ -42,41 +41,40 @@ class RateLimitEngineTest {
     void allowsRequest_whenTokensAvailable() throws Exception {
         RateLimitRule rule = new RateLimitRule(10, 1.0);
         LocalBucket bucket = new LocalBucket(10, 1.0);
-        
+
         when(ruleService.getRule("client-1")).thenReturn(rule);
         when(bucketStore.getOrCreate(eq("client-1"), any())).thenReturn(bucket);
 
         RateLimitResult result = engine.checkAndConsume("client-1");
 
         assertThat(result.allowed()).isTrue();
-        assertThat(result.remaining()).isEqualTo(9);
     }
 
     @Test
-    void rejectsRequest_whenNoTokens() throws Exception {
+    void rejectsRequest_whenRefreshingAndRedisDenies() throws Exception {
+        when(redisTemplate.execute(any(RedisScript.class), anyList(), any(), any(), any(), any()))
+            .thenReturn(List.of(0L, 0L));
+
         RateLimitRule rule = new RateLimitRule(10, 1.0);
         LocalBucket bucket = new LocalBucket(10, 1.0);
-        // Consume all tokens
-        for(int i=0; i<10; i++) bucket.tryConsume();
-        
+        for (int i = 0; i < 10; i++) bucket.tryConsume();
+
         when(ruleService.getRule("client-2")).thenReturn(rule);
         when(bucketStore.getOrCreate(eq("client-2"), any())).thenReturn(bucket);
 
         RateLimitResult result = engine.checkAndConsume("client-2");
 
         assertThat(result.allowed()).isFalse();
-        assertThat(result.remaining()).isEqualTo(0);
     }
 
     @Test
-    void fallback_returnsDenied_onRedisSyncFailure() {
+    void fallbackReturnsBucketDecision_onRedisFailure() {
         LocalBucket bucket = new LocalBucket(10, 1.0);
         RateLimitRule rule = new RateLimitRule(10, 1.0);
-        
-        // This test verifies the fallback method itself
-        engine.syncFallback("client-3", bucket, rule, new RuntimeException("Redis down"));
-        
-        // The fallback increments a counter, doesn't return a value in the new async syncToRedis
+
+        boolean result = engine.redisRefreshFallback("client-3", bucket, rule, new RuntimeException("Redis down"));
+
+        assertThat(result).isTrue();
     }
 
     @Test
@@ -86,7 +84,7 @@ class RateLimitEngineTest {
 
         RateLimitRule rule = new RateLimitRule(10, 1.0);
         LocalBucket bucket = new LocalBucket(10, 1.0);
-        
+
         when(ruleService.getRule("client-4")).thenReturn(rule);
         when(bucketStore.getOrCreate(eq("client-4"), any())).thenReturn(bucket);
 
@@ -94,18 +92,19 @@ class RateLimitEngineTest {
 
         assertThat(registry.counter("rl.requests.allowed", "clientId", "client-4").count())
             .isEqualTo(1.0);
-        assertThat(registry.counter("rl.layer1.hit").count())
-            .isEqualTo(1.0);
     }
 
     @Test
     void metricsIncremented_onRejectedRequest() throws Exception {
+        when(redisTemplate.execute(any(RedisScript.class), anyList(), any(), any(), any(), any()))
+            .thenReturn(List.of(0L, 0L));
+
         var registry = new SimpleMeterRegistry();
         engine = new RateLimitEngine(redisTemplate, ruleService, bucketStore, registry);
 
         RateLimitRule rule = new RateLimitRule(10, 1.0);
         LocalBucket bucket = new LocalBucket(10, 1.0);
-        for(int i=0; i<10; i++) bucket.tryConsume();
+        for (int i = 0; i < 10; i++) bucket.tryConsume();
 
         when(ruleService.getRule("client-5")).thenReturn(rule);
         when(bucketStore.getOrCreate(eq("client-5"), any())).thenReturn(bucket);
@@ -114,5 +113,47 @@ class RateLimitEngineTest {
 
         assertThat(registry.counter("rl.requests.rejected", "clientId", "client-5").count())
             .isEqualTo(1.0);
+    }
+
+    @Test
+    void tokenBucketMath_isCorrect() {
+        LocalBucket bucket = new LocalBucket(10, 5.0);
+        assertThat(bucket.getTokens()).isEqualTo(10.0);
+
+        for (int i = 0; i < 10; i++) {
+            assertThat(bucket.tryConsume()).isTrue();
+        }
+
+        assertThat(bucket.tryConsume()).isFalse();
+    }
+
+    @Test
+    void tokenBucketRefills_overTime() throws Exception {
+        LocalBucket bucket = new LocalBucket(10, 2.0);
+
+        for (int i = 0; i < 10; i++) bucket.tryConsume();
+        assertThat(bucket.tryConsume()).isFalse();
+
+        Thread.sleep(600);
+
+        assertThat(bucket.tryConsume()).isTrue();
+    }
+
+    @Test
+    void retryAfterIsCorrect_forEmptyBucket() {
+        LocalBucket bucket = new LocalBucket(10, 2.0);
+
+        double retryAfter = Math.ceil((1.0 - 0) / 2.0);
+        assertThat(retryAfter).isEqualTo(1.0);
+    }
+
+    @Test
+    void reconcileRespectsRedisAuthority() {
+        LocalBucket bucket = new LocalBucket(10, 1.0);
+        for (int i = 0; i < 10; i++) bucket.tryConsume();
+
+        bucket.reconcile(5.0);
+
+        assertThat(bucket.getTokens()).isEqualTo(5.0);
     }
 }

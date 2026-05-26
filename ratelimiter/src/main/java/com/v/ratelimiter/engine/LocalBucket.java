@@ -48,7 +48,7 @@ public class LocalBucket {
     }
 
     public synchronized void reconcile(double redisTokens) {
-        tokens = Math.min(tokens, redisTokens);
+        tokens = redisTokens;
         lastRefillSeconds = System.currentTimeMillis() / 1000.0;
         lastRedisSyncMs = System.currentTimeMillis();
         refreshing = false;

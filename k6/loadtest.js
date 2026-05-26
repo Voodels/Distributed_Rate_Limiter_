@@ -26,7 +26,7 @@ const BASE_URL = 'http://localhost:8081';
 
 export default function () {
   // Simulate different clients
-  const clientId = `client-${Math.floor(Math.random() * 2how 0)}`;
+  const clientId = `client-${Math.floor(Math.random() * 200)}`;
 
   const start = Date.now();
 
