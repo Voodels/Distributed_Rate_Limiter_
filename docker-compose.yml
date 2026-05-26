@@ -1,0 +1,79 @@
+services:
+  redis:
+    image: redis:7.2
+    command: redis-server --appendonly yes
+    ports: ["6379:6379"]
+    volumes: [redis-data:/data]
+    networks:
+      - ratelimit-net
+
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    command: --redis.addr redis://redis:6379
+    ports: ["9121:9121"]
+    depends_on: [redis]
+    networks:
+      - ratelimit-net
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports: ["9090:9090"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - ratelimit-net
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports: ["3000:3000"]
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus]
+    networks:
+      - ratelimit-net
+
+  ratelimiter:
+    build: ./ratelimiter
+    ports: ["8081:8081"]
+    environment:
+      - SPRING_DATA_REDIS_HOST=redis
+    depends_on: [redis]
+    networks:
+      - ratelimit-net
+    logging:
+      driver: json-file
+      options:
+        tag: "{{.Name}}"
+
+  loki:
+    image: grafana/loki:2.9.4
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - ratelimit-net
+
+  promtail:
+    image: grafana/promtail:2.9.4
+    volumes:
+      - /var/log:/var/log
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./observability/promtail-config.yml:/etc/promtail/config.yml
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - ratelimit-net
+
+volumes:
+  redis-data: {}
+  grafana-data: {}
+
+networks:
+  ratelimit-net:
+    driver: bridge

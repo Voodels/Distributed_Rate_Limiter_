@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: ratelimiter
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ['ratelimiter:8081', 'host.docker.internal:8081']
+
+  - job_name: redis
+    static_configs:
+      - targets: ['redis-exporter:9121']
