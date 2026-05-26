@@ -20,21 +20,22 @@ A production-grade distributed rate limiter with Gotham-styled Grafana dashboard
 
 ```mermaid
 flowchart LR
-  C[Client / API / k6]
+  C["Client / API / k6"]
 
-  subgraph Pod[Rate Limiter Pod (stateless)]
-    I[RateLimitInterceptor]
-    E[RateLimitEngine]
-    L[LocalBucket\n(500ms read-through cache)]
+  subgraph Pod["Rate Limiter Pod (stateless)"]
+    direction TB
+    I["RateLimitInterceptor"]
+    E["RateLimitEngine"]
+    L["LocalBucket<br/>500ms read-through cache"]
     I --> E
     E --> L
   end
 
   C --> I
-  E -->|Lua script| R[(Redis\nAuthoritative)]
-  E -->|metrics| P[Prometheus]
-  E -->|logs| LK[Loki]
-  P --> G[Grafana]
+  E -->|Lua script| R[(Redis<br/>Authoritative)]
+  E -->|metrics| P["Prometheus"]
+  E -->|logs| LK["Loki"]
+  P --> G["Grafana"]
   LK --> G
 ```
 
