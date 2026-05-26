@@ -1,111 +1,95 @@
 # DRL-1 — Distributed Rate Limiter
 
-A production-grade distributed rate limiter with Palantir Gotham-styled Grafana dashboards, Loki-based log panels, and structured JSON logging. Built with Spring Boot 3.3.4 on JDK 21 virtual threads.
+A production-grade distributed rate limiter with Gotham-styled Grafana dashboards, Loki-backed log panels, and structured JSON logging. Built with Spring Boot 3.3.4 on JDK 21 virtual threads.
+
+---
+
+## Overview
+
+- **Redis-authoritative** rate limiting with a local 500ms read-through cache
+- **Circuit-breaker guarded** Redis refresh path for graceful degradation
+- **Structured JSON logging** wired to Loki + Grafana
+- **Micrometer metrics** with Prometheus scraping
+- **Dockerized full stack** for local observability and load testing
 
 ---
 
 ## Architecture
 
-### Hybrid Distributed Design
+### System Overview
 
-```
-┌─────────────┐     ┌──────────────────────────────────────────────────────┐
-│   Client    │────▶│              Rate Limiter Pod (stateless)             │
-│  (k6 / API) │     │                                                      │
-└─────────────┘     │  ┌────────────┐   ┌───────────────────────────────┐  │
-                    │  │ Interceptor│   │        Core Engine             │  │
-                    │  │            │   │                               │  │
-                    │  │ extract-   │   │  ┌─────────────────────────┐  │  │
-                    │  │ ClientId() │──▶│  │  checkAndConsume()      │  │  │
-                    │  │            │   │  │                         │  │  │
-                    │  │ X-RateLimit│   │  │  ┌──────────────────┐  │  │  │
-                    │  │ headers    │   │  │  │ acquireRefresh-  │  │  │  │
-                    │  └────────────┘   │  │  │ Lock()           │  │  │  │
-                    │                   │  │  │  stale? &&       │  │  │  │
-                    │                   │  │  │  !refreshing?    │  │  │  │
-                    │                   │  │  └────────┬─────────┘  │  │  │
-                    │                   │  │           │             │  │  │
-                    │                   │  │  ┌────────▼─────────┐  │  │  │
-                    │                   │  │  │  refreshFromRedis│  │  │  │
-                    │                   │  │  │  (CB-wrapped)    │  │  │  │
-                    │                   │  │  │  ┌──────┬──────┐ │  │  │  │
-                    │                   │  │  │  │Lua   │Fbk   │ │  │  │  │
-                    │                   │  │  │  │Script│      │ │  │  │  │
-                    │                   │  │  │  └──┬───┴──────┘ │  │  │  │
-                    │                   │  │  └─────┼────────────┘  │  │  │
-                    │                   │  │        │               │  │  │
-                    │                   │  │  ┌─────▼────────────┐  │  │  │
-                    │                   │  │  │ tryConsume()     │  │  │  │
-                    │                   │  │  │ (local refill +  │  │  │  │
-                    │                   │  │  │  deduct)         │  │  │  │
-                    │                   │  │  └──────────────────┘  │  │  │
-                    │                   │  └─────────────────────────┘  │  │
-                    │                   └───────────────────────────────┘  │
-                    └──────────────────────────────────────────────────────┘
-                                        │
-                          ┌─────────────┴──────────────┐
-                          ▼                            ▼
-                   ┌────────────┐            ┌──────────────────┐
-                   │   Redis    │            │   LocalBucket    │
-                   │(authorita- │            │  (500ms TTL      │
-                   │ tive truth) │            │   read-through)  │
-                   │ Lua script │            │                  │
-                   │ HMGET/HSET │            │ tokens + refill  │
-                   │ EXPIRE     │            │ per wall clock   │
-                   └────────────┘            └──────────────────┘
+```mermaid
+flowchart LR
+  C["Client / API / k6"]
+
+  subgraph Pod["Rate Limiter Pod (stateless)"]
+    direction TB
+    I["RateLimitInterceptor"]
+    E["RateLimitEngine"]
+    L["LocalBucket<br>500ms read-through cache"]
+    I --> E
+    E --> L
+  end
+
+  C --> I
+  E -->|Lua script| R[("Redis<br>Authoritative")]
+  E -->|metrics| P["Prometheus"]
+  E -->|logs| LK["Loki"]
+  P --> G["Grafana"]
+  LK --> G
 ```
 
-**Key property**: Redis is the **authoritative source of truth** on every request. The local bucket is a 500ms read-through cache for performance — never makes decisions independently.
+**Key property**: Redis is the **authoritative source of truth** on every request. The local bucket is a 500ms read-through cache for performance — it never authorizes requests without a Redis sync within the last 500ms.
 
-### Critical Path (per request)
+### Request Flow (Critical Path)
 
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant I as Interceptor
+  participant E as RateLimitEngine
+  participant L as LocalBucket
+  participant R as Redis
+
+  C->>I: HTTP request
+  I->>E: checkAndConsume(clientId)
+  E->>L: getOrCreate(clientId)
+
+  alt cache stale & lock won
+    E->>R: Lua script (HMGET/HSET/EXPIRE)
+    R-->>E: allowed, remaining
+    E->>L: reconcile(redisTokens)
+  else cache fresh or lock lost
+    Note over E,L: skip refresh
+  end
+
+  E->>L: tryConsume()
+  E-->>I: RateLimitResult
+  I-->>C: 200/429 + headers
 ```
-checkAndConsume(clientId):
-  1. getOrCreate(clientId) → LocalBucket or new
-  2. acquireRefreshLock()
-     ├─ cache stale (>500ms) AND no one refreshing → LOCK WON → set refreshing=true
-     └─ cache fresh OR someone refreshing → skip
-  3. [if lock won] refreshFromRedis(clientId, bucket, rule)
-     ├─ CB CLOSED → Lua script → Redis HMGET/HSET → bucket.reconcile(redisTokens)
-     └─ CB OPEN → redisRefreshFallback()
-        → bucket.refreshFailed() + bucket.postponeRefresh()
-  4. bucket.tryConsume() → local wall-clock refill + deduct 1 token
-  5. increment Micrometer counter (allowed/rejected)
-  6. return RateLimitResult(allowed, remaining, resetEpoch)
-```
+
+**Critical path (per request)**
+1. `getOrCreate(clientId)` → `LocalBucket` (or new)
+2. `acquireRefreshLock()` (only the winner refreshes)
+3. `refreshFromRedis()` (CB-wrapped) → Lua → Redis `HMGET/HSET`
+4. `tryConsume()` → local refill + deduct 1 token
+5. increment Micrometer counters
+6. return `RateLimitResult(allowed, remaining, resetEpoch)`
 
 ### Degraded Mode (Circuit Breaker OPEN)
 
-The circuit breaker wraps `refreshFromRedis()` with:
-
-| Setting | Value |
-|---------|-------|
-| `slidingWindowSize` | 10 |
-| `failureRateThreshold` | 50% |
-| `waitDurationInOpenState` | 5s |
-
-When Redis is down and CB opens:
-
-```
-t=0    stale=true, refreshing=false → LOCK WON
-       → CB short-circuits → redisRefreshFallback()
-       → refreshFailed() + postponeRefresh(lastRedisSyncMs=now)
-       → tryConsume() on stale local cache
-
-t=1ms  stale=(now - lastRedisSyncMs) < 500ms → skip refresh
-       → tryConsume() on stale cache
-
-t=500ms stale=true, refreshing=false → LOCK WON
-        → CB still OPEN → fallback() again
-        → refreshFailed() + postponeRefresh()
-        → repeat every 500ms
-
-After Redis recovers → CB HALF_OPEN
-  → next stale request → Lua script succeeds → reconcile()
-  → back to normal operation
+```mermaid
+stateDiagram-v2
+  [*] --> Closed
+  Closed --> Open: failureRate >= 50% (10 calls)
+  Open --> HalfOpen: waitDuration = 5s
+  HalfOpen --> Closed: success
+  HalfOpen --> Open: failure
 ```
 
-**Max drift during CB OPEN**: `5s × 0.16 t/s + 0.5s stale = ~0.88 tokens`. Negligible.
+When Redis is down and the circuit breaker opens, refresh falls back to a local stale cache. Refresh attempts are throttled to once per 500ms during OPEN, then recover automatically on HALF_OPEN success.
+
+**Max drift during CB OPEN**: `5s × 0.16 t/s + 0.5s stale = ~0.88 tokens` (negligible).
 
 **Critical bug fixed**: Previously `redisRefreshFallback()` did not call `refreshFailed()` and returned normally (no exception), so the catch block was never entered. The `refreshing` flag stayed `true` forever — the bucket could never sync from Redis again without a pod restart. The fix adds `bucket.refreshFailed()` + `bucket.postponeRefresh()` in the fallback.
 
@@ -166,7 +150,7 @@ ratelimiter/src/main/java/com/v/ratelimiter/
 ├── domain/
 │   ├── RateLimitResult.java       — Immutable record: allowed, remaining, resetEpoch
 │   ├── RateLimitRule.java         — Immutable record: capacity, refillRatePerSecond
-│   └── RuleUpdateEvent.java      — Pub/Sub event for dynamic rule updates
+│   └── RuleUpdateEvent.java       — Pub/Sub event for dynamic rule updates
 ├── engine/
 │   ├── RateLimitEngine.java       — checkAndConsume() HOT PATH, Lua script, CB-wrapped refresh
 │   ├── RateLimitRuleService.java  — Rule lookup with ConcurrentHashMap cache + Redis Pub/Sub
@@ -180,15 +164,11 @@ ratelimiter/src/main/java/com/v/ratelimiter/
 
 ### Key Classes
 
-**`RateLimitEngine.checkAndConsume(String clientId)`** — The hot path called on every HTTP request. Never blocks waiting for Redis (uses `acquireRefreshLock()` which returns immediately). If cache is stale and lock is won, refreshes asynchronously (from the caller's perspective — it's synchronous but only the winner does it).
-
-**`LocalBucket`** — Per-client in-memory token bucket. Uses `synchronized` on all methods (see improvement #1 for StampedLock upgrade). Self-refills on every `tryConsume()` call using wall-clock time. Never makes distributed decisions — only Redis is authoritative.
-
-**`LocalBucketStore`** — `ConcurrentHashMap<String, LocalBucket>` with a 5-minute virtual-thread-based eviction sweep. Evicts clients not seen for 10 minutes. Exposes a `rl.local.bucket.count` gauge.
-
-**`RateLimitInterceptor`** — Implements `HandlerInterceptor.preHandle()`. Extracts client ID from headers (priority: `X-Client-Id` > `X-API-Key` > `Authorization: Bearer` > `X-Forwarded-For` > remote IP). Sets `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers, `Retry-After` on 429. Logs every decision as structured JSON.
-
-**`RateLimitRuleService`** — Holds a `ConcurrentHashMap` of per-client rules. Listens on Redis Pub/Sub for real-time rule updates. Default rule: `RateLimitRule(10, 0.16)`.
+- **`RateLimitEngine.checkAndConsume(String clientId)`** — The hot path called on every HTTP request. Never blocks waiting for Redis (uses `acquireRefreshLock()` which returns immediately). If cache is stale and lock is won, refreshes from Redis (synchronous refresh performed only by the lock winner).
+- **`LocalBucket`** — Per-client in-memory token bucket. Uses `synchronized` on all methods (see improvement #1 for StampedLock upgrade). Self-refills on every `tryConsume()` call using wall-clock time. Never makes distributed decisions — only Redis is authoritative.
+- **`LocalBucketStore`** — `ConcurrentHashMap<String, LocalBucket>` with a 5-minute virtual-thread-based eviction sweep. Evicts clients not seen for 10 minutes. Exposes a `rl.local.bucket.count` gauge.
+- **`RateLimitInterceptor`** — Implements `HandlerInterceptor.preHandle()`. Extracts client ID from headers (priority: `X-Client-Id` > `X-API-Key` > `Authorization: Bearer` > `X-Forwarded-For` > remote IP). Sets `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers, `Retry-After` on 429. Logs every decision as structured JSON.
+- **`RateLimitRuleService`** — Holds a `ConcurrentHashMap` of per-client rules. Listens on Redis Pub/Sub for real-time rule updates. Default rule: `RateLimitRule(10, 0.16)`.
 
 ---
 
@@ -341,7 +321,7 @@ For any AI agent continuing work on this project:
 
 ### Common pitfalls
 
-- **`refreshFromRedis()` is CB-wrapped**: the annotation `@CircuitBreaker` on a `public` method called from within the same class won't trigger the proxy. Currently called from `checkAndConsume()` in the same class — this works because Spring AOP proxies intercept `@CircuitBreaker` on external calls, but `checkAndConsume()` calls `refreshFromRedis()` directly (self-invocation). **This means the CB proxy does NOT intercept the call.** The CB effectively does nothing. To fix: either (a) inject `RateLimitEngine` self-proxy via `@Autowired` + `@Lazy` and call `self.refreshFromRedis()`, or (b) extract refresh logic into a separate `@Component` bean. **This is a known issue — the CB currently only works if external callers invoke `refreshFromRedis()` directly, which never happens in the hot path.**
+- **`refreshFromRedis()` is CB-wrapped**: the annotation `@CircuitBreaker` on a `public` method called from within the same class won't trigger the proxy. Currently called from `checkAndConsume()` in the same class — this works because Spring AOP proxies intercept `@CircuitBreaker` on external calls, but `checkAndConsume()` calls `refreshFromRedis()` directly (self-invocation). **This means the CB proxy does NOT intercept the call. The CB effectively does nothing in the hot path.** To fix: either (a) inject `RateLimitEngine` self-proxy via `@Autowired` + `@Lazy` and call `self.refreshFromRedis()`, or (b) extract refresh logic into a separate `@Component` bean. **This is a known issue — the CB currently only works if external callers invoke `refreshFromRedis()` directly, which never happens in the hot path.**
 - **`synchronized` on all LocalBucket methods**: fine for correctness but limits throughput under high contention (improvement #1).
 - **Promtail regex stage doesn't parse logstash JSON**: the current `promtail-config.yml` regex expects plain-text log format, not JSON. Logs are shipped to Loki but `level` labels are not correctly extracted.
 - **`now` parameter passed to Lua script from Java clock**: multi-replica clock skew can cause race conditions at higher refill rates (improvement #3).
