@@ -38,7 +38,7 @@ flowchart LR
   LK --> G
 ```
 
-**Key property**: Redis is the **authoritative source of truth** on every request. The local bucket is a 500ms read-through cache for performance — it never authorizes requests independently; all decisions are validated against Redis.
+**Key property**: Redis is the **authoritative source of truth** on every request. The local bucket is a 500ms read-through cache for performance — it never authorizes requests without a Redis sync within the last 500ms.
 
 ### Request Flow (Critical Path)
 
@@ -163,7 +163,7 @@ ratelimiter/src/main/java/com/v/ratelimiter/
 
 ### Key Classes
 
-- **`RateLimitEngine.checkAndConsume(String clientId)`** — The hot path called on every HTTP request. Never blocks waiting for Redis (uses `acquireRefreshLock()` which returns immediately). If cache is stale and lock is won, refreshes synchronously (from the caller's perspective — it's synchronous but only the winner does it).
+- **`RateLimitEngine.checkAndConsume(String clientId)`** — The hot path called on every HTTP request. Never blocks waiting for Redis (uses `acquireRefreshLock()` which returns immediately). If cache is stale and lock is won, refreshes from Redis (synchronous refresh performed only by the lock winner).
 - **`LocalBucket`** — Per-client in-memory token bucket. Uses `synchronized` on all methods (see improvement #1 for StampedLock upgrade). Self-refills on every `tryConsume()` call using wall-clock time. Never makes distributed decisions — only Redis is authoritative.
 - **`LocalBucketStore`** — `ConcurrentHashMap<String, LocalBucket>` with a 5-minute virtual-thread-based eviction sweep. Evicts clients not seen for 10 minutes. Exposes a `rl.local.bucket.count` gauge.
 - **`RateLimitInterceptor`** — Implements `HandlerInterceptor.preHandle()`. Extracts client ID from headers (priority: `X-Client-Id` > `X-API-Key` > `Authorization: Bearer` > `X-Forwarded-For` > remote IP). Sets `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers, `Retry-After` on 429. Logs every decision as structured JSON.
